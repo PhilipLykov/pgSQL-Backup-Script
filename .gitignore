@@ -1,94 +1,50 @@
-
-*~
-*$py.class
-/1c-enterprise-8.3.27.1786-common_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-common-nls_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-crs_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-server_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-server-nls_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-ws_8.3.27-1786_amd64.deb
-/1c-enterprise-8.3.27.1786-ws-nls_8.3.27-1786_amd64.deb
-/aksusbd_10.21-1_amd64.deb
-*_backup_*/
-backup_*/
-# Backup files
-backups/
-/.bash_history
-/.bash_logout
-/.bashrc
-/.cache
-/check_samba_sessions.sh
-config.enc
-/create_swap_on_sdc.sh
-/.cursor
-/.cursor-server
-/deb64_8_3_27_1786.zip
-/diagnose_samba_connection.sh
-.DS_Store
-*.dump
-*.enc
-.encryption_key
-env/
-ENV/
-.failed_uploads.json
-# Failed upload tracking
-/fix_fpdocs_permissions.sh
-/fix_fsfpdocs_connection.sh
-/fix_ftp_directory.sh
-/fix_ftp_pam.sh
-/fix_ftp_scanner_cwd.sh
-/fix_ftp_scanner.sh
-/fix_ftp_write_permissions.sh
-/fix_samba_credential_cache.sh
-/fix_samba_user.sh
-/FTP_SERVER_README.md
-.idea/
-# IDE files
-*.key
-*.lock
-# Lock files
-*.log
-# Log files
-logs/
-/monitor_samba_auth.sh
-# OS files
-# Personal/sensitive information
-pgbackup.lock
-*.pgpass
-.pgpass
-# PostgreSQL password files
-/.profile
-/PROXMOX_VM_UNLOCK_GUIDE.md
+# Python
 __pycache__/
 *.py[cod]
-.Python
-# Python cache
-/reset_ftp_password.sh
-/SAMBA_FSFPDOCS_ISSUE_SUMMARY.md
-/samba_troubleshooting_guide.md
-/Sentinel_LDK_Ubuntu_DEB_Run-time_Installer.tar.gz
-/setup_ftp_server.sh
-/simple_reset_ftp_password.sh
+*$py.class
 *.so
+.Python
+env/
+ENV/
+venv/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+.cursor-server/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive / runtime files
+config.enc
+.encryption_key
+*.key
+*.pgpass
+.pgpass
+.failed_uploads.json
+*.lock
+
+# Backup data (never commit actual backups)
 *.sql
 *.sql.gz
-/.sudo_as_admin_successful
-*.swo
-*.swp
+*.dump
+backups/
+backup_*/
+*_backup_*/
+tmp/
 temp/
-# Temporary files
-# Test files
-/test_ftp_connection.sh
+logs/
+*.log
+*.tmp
 test_*.gz
 test_*.sql
-Thumbs.db
-*.tmp
-tmp/
-/unlock_proxmox_vm.sh
-/unlock_vm_manual.sh# Sensitive configuration files
+
+# Server paths
 /var/backups/pgbackup/
 /var/log/pgbackup/
-venv/
-# Virtual environments
-.vscode/
-/.Xauthority

@@ -58,6 +58,8 @@ RETENTION_DAYS = 365  # 1 year (Azure)
 LOCAL_RETENTION_DAYS = 7  # 7 days (local, after successful upload)
 MIN_DISK_SPACE_MB = 1024  # Minimum 1GB free space required
 MAX_UPLOAD_RETRIES = 3  # Maximum retry attempts for failed uploads
+MAX_LOCAL_BACKUPS = 30  # Maximum local backup files to keep (safety cap for offline scenarios)
+NETWORK_CHECK_TIMEOUT = 5  # Seconds to wait for network connectivity check
 
 # Setup logging
 LOG_FILE = None
@@ -97,6 +99,13 @@ logging.basicConfig(
     handlers=handlers
 )
 logger = logging.getLogger(__name__)
+
+# Suppress verbose Azure SDK HTTP request/response logging.
+# Without this, every HTTP call logs full URL, headers, and body status at INFO level,
+# producing tens of thousands of lines per run.
+logging.getLogger('azure').setLevel(logging.WARNING)
+logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 class PostgreSQLBackup:
     """PostgreSQL backup and maintenance manager"""
@@ -144,6 +153,25 @@ class PostgreSQLBackup:
         self.pg_user = pg_user
         # Get connection method: 'unix_socket' (peer auth) or 'tcp' (password auth)
         self.pg_connection_method = self.config.get('pg_connection_method', 'tcp')
+        self.is_online = False  # Set by _check_network_connectivity()
+    
+    def _check_network_connectivity(self) -> bool:
+        """Quick check whether the Azure storage endpoint is reachable.
+        Uses a TCP connect to port 443 with a short timeout so we don't waste
+        hours retrying uploads when the network is down."""
+        account_name = self.config.get('azure_account_name', '')
+        host = f"{account_name}.blob.core.windows.net" if account_name else "blob.core.windows.net"
+        try:
+            sock = socket.create_connection((host, 443), timeout=NETWORK_CHECK_TIMEOUT)
+            sock.close()
+            self.is_online = True
+            logger.info(f"Network check passed: {host} is reachable")
+            return True
+        except (socket.timeout, socket.error, OSError) as e:
+            self.is_online = False
+            logger.warning(f"Network check failed: cannot reach {host} ({e})")
+            logger.warning("All Azure operations will be skipped this run")
+            return False
     
     def _build_pg_connection_args(self, user: str, database: str = None) -> list:
         """
@@ -935,16 +963,23 @@ class PostgreSQLBackup:
             return deleted_count
     
     def cleanup_local_backups(self) -> int:
-        """Clean up local backup files older than retention period
-        Only deletes files that have been successfully uploaded to Azure
-        Failed uploads are kept for retry
-        Also cleans up any leftover temp files"""
+        """Clean up local backup files.
+
+        Cleanup strategy (applied in order):
+        1. Delete leftover temp files.
+        2. Delete files whose upload retries are exhausted (>= MAX_UPLOAD_RETRIES).
+        3. Delete successfully-uploaded files older than LOCAL_RETENTION_DAYS.
+        4. Enforce MAX_LOCAL_BACKUPS cap -- oldest files are removed first regardless
+           of upload status so that disk never fills up during extended outages.
+        5. Emergency disk-space cleanup -- if free space < MIN_DISK_SPACE_MB, keep
+           deleting oldest local backups until the threshold is met.
+        """
         logger.info("Cleaning up old local backups...")
-        
+
         deleted_count = 0
         cutoff_date = datetime.now() - timedelta(days=LOCAL_RETENTION_DAYS)
-        
-        # Clean up any leftover temp files first
+
+        # --- 1. Clean up leftover temp files ---
         try:
             if TEMP_DIR.exists():
                 for tmp_file in TEMP_DIR.glob("*.sql"):
@@ -955,43 +990,78 @@ class PostgreSQLBackup:
                         logger.warning(f"Error deleting temp file {tmp_file.name}: {str(e)}")
         except Exception as e:
             logger.warning(f"Error cleaning temp directory: {str(e)}")
-        
+
         try:
-            for backup_file in self.backup_dir.glob("*.sql.gz"):
+            # --- 2 & 3. Retention-based and retry-exhausted cleanup ---
+            for backup_file in list(self.backup_dir.glob("*.sql.gz")):
                 try:
-                    # Skip the failed uploads tracking file
-                    if backup_file.name == ".failed_uploads.json":
-                        continue
-                    
-                    file_time = datetime.fromtimestamp(backup_file.stat().st_mtime)
-                    
-                    # Only delete if:
-                    # 1. File is older than retention period AND
-                    # 2. File is NOT in failed uploads list (meaning it was successfully uploaded)
                     file_str = str(backup_file)
                     is_failed_upload = file_str in self.failed_uploads
-                    
-                    if file_time < cutoff_date and not is_failed_upload:
-                        backup_file.unlink()
-                        deleted_count += 1
-                        logger.info(f"Deleted old local backup: {backup_file.name} (successfully uploaded)")
-                    elif is_failed_upload:
-                        # Check if retry limit exceeded
+
+                    # 2. Delete files that exhausted their upload retries
+                    if is_failed_upload:
                         upload_info = self.failed_uploads[file_str]
                         retry_count = upload_info.get('retry_count', 0)
                         if retry_count >= MAX_UPLOAD_RETRIES:
-                            # Max retries exceeded, delete file and remove from failed list
                             logger.warning(f"Deleting backup {backup_file.name} after {retry_count} failed upload attempts")
                             backup_file.unlink()
                             del self.failed_uploads[file_str]
                             deleted_count += 1
                             self._save_failed_uploads()
+                            continue
+
+                    # 3. Delete successfully-uploaded files older than retention
+                    file_time = datetime.fromtimestamp(backup_file.stat().st_mtime)
+                    if file_time < cutoff_date and not is_failed_upload:
+                        backup_file.unlink()
+                        deleted_count += 1
+                        logger.info(f"Deleted old local backup: {backup_file.name} (successfully uploaded)")
                 except Exception as e:
                     logger.warning(f"Error deleting {backup_file.name}: {str(e)}")
-            
+
+            # --- 4. Enforce MAX_LOCAL_BACKUPS cap ---
+            remaining = sorted(self.backup_dir.glob("*.sql.gz"), key=lambda p: p.stat().st_mtime)
+            while len(remaining) > MAX_LOCAL_BACKUPS:
+                oldest = remaining.pop(0)
+                file_str = str(oldest)
+                try:
+                    logger.warning(f"Enforcing local backup limit: deleting {oldest.name} "
+                                   f"({len(remaining) + 1} > {MAX_LOCAL_BACKUPS})")
+                    oldest.unlink()
+                    deleted_count += 1
+                    if file_str in self.failed_uploads:
+                        del self.failed_uploads[file_str]
+                        self._save_failed_uploads()
+                except Exception as e:
+                    logger.warning(f"Error deleting {oldest.name}: {str(e)}")
+
+            # --- 5. Emergency disk-space cleanup ---
+            try:
+                stat = shutil.disk_usage(self.backup_dir)
+                free_mb = stat.free / (1024 * 1024)
+                remaining = sorted(self.backup_dir.glob("*.sql.gz"), key=lambda p: p.stat().st_mtime)
+                while free_mb < MIN_DISK_SPACE_MB and remaining:
+                    oldest = remaining.pop(0)
+                    file_str = str(oldest)
+                    try:
+                        logger.warning(f"Emergency disk cleanup: deleting {oldest.name} "
+                                       f"(free: {free_mb:.0f} MB < {MIN_DISK_SPACE_MB} MB)")
+                        oldest.unlink()
+                        deleted_count += 1
+                        if file_str in self.failed_uploads:
+                            del self.failed_uploads[file_str]
+                            self._save_failed_uploads()
+                        stat = shutil.disk_usage(self.backup_dir)
+                        free_mb = stat.free / (1024 * 1024)
+                    except Exception as e:
+                        logger.warning(f"Error deleting {oldest.name}: {str(e)}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not perform disk-space cleanup: {str(e)}")
+
             logger.info(f"Local cleanup completed: deleted {deleted_count} files")
             return deleted_count
-            
+
         except Exception as e:
             logger.error(f"Error during local cleanup: {str(e)}")
             return deleted_count
@@ -1034,9 +1104,10 @@ class PostgreSQLBackup:
                 logger.info(f"Successfully retried upload of {backup_file.name}")
             else:
                 failed_retries += 1
+                self._mark_upload_failed(backup_file)
                 upload_info = self.failed_uploads.get(file_str, {})
                 retry_count = upload_info.get('retry_count', 0)
-                logger.warning(f"Retry failed for {backup_file.name} (attempt {retry_count + 1}/{MAX_UPLOAD_RETRIES})")
+                logger.warning(f"Retry failed for {backup_file.name} (attempt {retry_count}/{MAX_UPLOAD_RETRIES})")
         
         if successful_retries > 0:
             logger.info(f"Successfully retried {successful_retries} upload(s)")
@@ -1133,17 +1204,25 @@ class PostgreSQLBackup:
                 self._send_final_notification(start_time)
                 return
             
+            # Network connectivity check (before any Azure operations)
+            self._check_network_connectivity()
+
             # Health checks
             logger.info("")
             is_healthy, health_issues = self.check_postgresql_health()
             if health_issues:
                 self.warnings.extend(health_issues)
-            
-            # STEP 1: Retry any previously failed uploads first
-            retry_success, retry_failed = self.retry_failed_uploads()
-            if retry_success > 0:
-                logger.info(f"Successfully retried {retry_success} previously failed upload(s)")
-            
+
+            # Retry previously failed uploads (only if online)
+            if self.is_online:
+                retry_success, retry_failed = self.retry_failed_uploads()
+                if retry_success > 0:
+                    logger.info(f"Successfully retried {retry_success} previously failed upload(s)")
+            else:
+                pending = len(self.failed_uploads)
+                if pending:
+                    logger.warning(f"Skipping retry of {pending} failed upload(s) -- network is offline")
+
             # Get databases
             logger.info("")
             logger.info("Getting list of databases to backup...")
@@ -1155,39 +1234,43 @@ class PostgreSQLBackup:
                 self.errors.append(error_msg)
                 self._send_final_notification(start_time)
                 return
-            
+
             logger.info(f"Found {len(databases)} database(s) to backup: {', '.join(databases)}")
             logger.info("")
-            
+
             # Backup each database
             successful_backups = 0
             failed_backups = 0
-            
+
             for db_name in databases:
                 logger.info("-" * 60)
                 logger.info(f"Processing database: {db_name}")
                 logger.info("-" * 60)
-                # STEP 1: Perform pre-backup maintenance (BEFORE backup)
-                # VACUUM ANALYZE and CHECKPOINT should be done before backup
+                # Pre-backup maintenance (VACUUM ANALYZE, CHECKPOINT)
                 self.perform_pre_backup_maintenance(db_name)
-                
-                # STEP 2: Perform the backup
+
+                # Perform the backup
                 backup_file = self.backup_database(db_name)
                 if backup_file:
-                    # STEP 3: Upload to Azure
-                    if self.upload_to_azure(backup_file):
-                        successful_backups += 1
-                        
-                        # STEP 4: Perform post-backup maintenance (AFTER successful backup)
-                        # Optional operations like REINDEX can be done after backup
-                        self.perform_post_backup_maintenance(db_name)
+                    if self.is_online:
+                        # Upload to Azure
+                        if self.upload_to_azure(backup_file):
+                            successful_backups += 1
+                            self.perform_post_backup_maintenance(db_name)
+                        else:
+                            failed_backups += 1
                     else:
+                        logger.warning(f"Skipping upload of {backup_file.name} -- network is offline")
+                        self._mark_upload_failed(backup_file)
                         failed_backups += 1
                 else:
                     failed_backups += 1
-            
-            # Cleanup old backups
-            self.cleanup_old_backups_azure()
+
+            # Cleanup old backups (Azure cleanup only if online)
+            if self.is_online:
+                self.cleanup_old_backups_azure()
+            else:
+                logger.info("Skipping Azure cleanup -- network is offline")
             self.cleanup_local_backups()
             
             # Summary

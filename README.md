@@ -4,21 +4,25 @@ A production-ready PostgreSQL backup and maintenance script with Azure Blob Stor
 
 ## Features
 
-- 🔒 **Secure**: Encrypted configuration, password sanitization, OWASP Top 10 compliant
-- ☁️ **Cloud Storage**: Automatic upload to Azure Blob Storage
-- 📧 **Notifications**: Email alerts for backup status
-- 🔄 **Automated**: Cron job support for scheduled backups
-- 🛡️ **Maintenance**: Pre-backup VACUUM/CHECKPOINT and post-backup REINDEX
-- 🔍 **Health Checks**: PostgreSQL connectivity and long-running query detection
-- 📊 **Retry Logic**: Failed uploads are tracked and retried
-- 🧹 **Cleanup**: Automatic cleanup of old backups (local and Azure)
+- **Secure**: Encrypted configuration, password sanitization, OWASP Top 10 compliant
+- **Cloud Storage**: Automatic upload to Azure Blob Storage with retry logic
+- **Network-Aware**: Detects offline state and skips Azure operations instead of hanging for hours on DNS timeouts
+- **Disk-Safe**: Hard cap on local backups (`MAX_LOCAL_BACKUPS`) and emergency disk-space cleanup prevent the server from running out of space during extended outages
+- **Notifications**: Email alerts for backup failures and warnings
+- **Automated**: Cron job and systemd timer support for scheduled backups
+- **Maintenance**: Pre-backup VACUUM/CHECKPOINT and optional post-backup REINDEX
+- **Health Checks**: PostgreSQL connectivity and long-running query detection
+- **Retry Logic**: Failed uploads are tracked, retried, and eventually cleaned up after `MAX_UPLOAD_RETRIES`
+- **Cleanup**: Automatic cleanup of old backups (local retention + Azure retention)
+- **Quiet Logs**: Azure SDK verbose HTTP logging is suppressed -- logs contain only meaningful backup information
 
 ## Requirements
 
 - Python 3.8+
-- PostgreSQL 9.6+
-- Azure Storage Account (optional, for cloud backups)
+- PostgreSQL 9.6+ (tested with PostgresPro 1C 17)
+- Azure Storage Account
 - SMTP server (optional, for email notifications)
+- Debian/Ubuntu Linux (uses `fcntl` for file locking)
 
 ## Installation
 
@@ -30,6 +34,8 @@ git clone https://github.com/PhilipLykov/pgSQL-Backup-Script.git
 cd pgSQL-Backup-Script
 
 # Move to /opt (recommended)
+sudo bash MOVE_TO_OPT.sh
+# Or manually:
 sudo mkdir -p /opt/pgSQL-bck-script
 sudo cp -r * /opt/pgSQL-bck-script/
 cd /opt/pgSQL-bck-script
@@ -51,195 +57,150 @@ The setup script will guide you through:
 - PostgreSQL connection method (Unix socket or TCP/IP)
 - Azure Storage account name, key, and container
 - Email notification settings (SMTP server, credentials)
-- Backup options (databases to backup, retention policies)
-- Maintenance options (VACUUM, CHECKPOINT, REINDEX)
-
-**Note:** During setup, you'll choose your PostgreSQL authentication method. The script can help create the `.pgpass` file if you choose TCP/IP authentication.
+- Databases to skip, maintenance options (VACUUM, CHECKPOINT, REINDEX)
 
 ### 3. Configure PostgreSQL Authentication
 
-Based on your choice during setup, complete the authentication configuration:
-
 #### Option A: Unix Socket (Recommended)
 
-- No password needed
+- No password needed, uses peer authentication
 - Script must run as `postgres` user
-- Uses peer authentication
 
-**Setup:**
 ```bash
-# Set up permissions (required for postgres user)
 sudo bash setup_permissions.sh
-
-# Test (must run as postgres user)
 sudo -u postgres python3 /opt/pgSQL-bck-script/pg_backup_main.py
 ```
 
 #### Option B: TCP/IP with .pgpass
 
 - Requires password authentication
-- More flexible user management
 - Can run as root or dedicated user
 
-**Setup:**
-
-The setup script can create the `.pgpass` file automatically when you choose TCP/IP authentication. If you need to create it manually:
-
 ```bash
-# Create dedicated backup user (optional but recommended)
 sudo bash setup_pg_auth.sh
-
-# Or manually create .pgpass file
-echo "localhost:5432:*:postgres:YOUR_PASSWORD" | sudo tee /root/.pgpass
-sudo chmod 600 /root/.pgpass
 ```
 
 All configuration is encrypted and stored in `/etc/pgbackup/config.enc`.
 
-**Important:** Complete the authentication setup (Step 3) before setting up automated backups.
-
 ### 4. Set Up Automated Backups
 
-**Option A: Automated Setup (Recommended)**
+**Option A: Cron (Recommended)**
 ```bash
 sudo bash setup_cron.sh
 ```
 
-**Option B: Manual Cron Setup**
-
-For Unix socket authentication:
+**Option B: systemd Timer**
 ```bash
-sudo -u postgres crontab -e
-# Add: 0 1 * * * /opt/pgSQL-bck-script/pg_backup_cron.sh
+sudo cp pg_backup.service pg_backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pg_backup.timer
 ```
 
-For TCP/IP authentication:
-```bash
-sudo crontab -e
-# Add: 0 1 * * * /opt/pgSQL-bck-script/pg_backup_cron.sh
-```
-
-The cron job runs daily at 1:00 AM. To change the schedule, edit the crontab entry:
-- `0 1 * * *` = Every day at 1:00 AM
-- `0 2 * * 0` = Every Sunday at 2:00 AM
-- `30 3 * * 1-5` = Monday-Friday at 3:30 AM
-
-## Usage
-
-### Manual Backup
-
-**Unix Socket (as postgres user):**
-```bash
-sudo -u postgres python3 /opt/pgSQL-bck-script/pg_backup_main.py
-```
-
-**TCP/IP (as root):**
-```bash
-sudo python3 /opt/pgSQL-bck-script/pg_backup_main.py
-```
-
-### Check Logs
+### 5. Install Log Rotation
 
 ```bash
-# Main backup log
-sudo tail -f /var/log/pgbackup/pgbackup_$(date +%Y%m%d).log
-
-# Cron execution log
-sudo tail -f /var/log/pgbackup/cron_*.log
-```
-
-### Verify Backups
-
-```bash
-# Local backups
-ls -lh /var/backups/pgbackup/
-
-# Check Azure (via Azure Portal)
+sudo cp pgbackup.logrotate /etc/logrotate.d/pgbackup
 ```
 
 ## Backup Process
 
-The script performs the following steps:
+1. **Lock**: Acquire file lock to prevent concurrent runs
+2. **Network Check**: TCP connect to Azure endpoint (5s timeout)
+3. **Health Checks**: PostgreSQL service status and connectivity
+4. **Retry Failed Uploads**: Re-upload previously failed backups (skipped if offline)
+5. **Pre-Backup Maintenance**: VACUUM ANALYZE + CHECKPOINT (per database)
+6. **Backup**: `pg_dump` + gzip compression (per database)
+7. **Upload**: Upload to Azure Blob Storage (skipped if offline, marked for retry)
+8. **Post-Backup Maintenance**: Optional REINDEX (per database)
+9. **Azure Cleanup**: Delete blobs older than `RETENTION_DAYS` (skipped if offline)
+10. **Local Cleanup**: Retention-based + `MAX_LOCAL_BACKUPS` cap + emergency disk-space cleanup
+11. **Notification**: Email summary on errors/warnings
 
-1. **Health Checks**: Verifies PostgreSQL connectivity
-2. **Pre-Backup Maintenance** (optional):
-   - VACUUM ANALYZE
-   - CHECKPOINT
-3. **Backup**: Creates compressed backups for each database
-4. **Upload**: Uploads to Azure Blob Storage (if configured)
-5. **Post-Backup Maintenance** (optional):
-   - REINDEX
-6. **Cleanup**: Removes old backups (local and Azure)
-7. **Notifications**: Sends email alerts (if configured)
+## Constants
 
-## Configuration Files
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `RETENTION_DAYS` | 365 | Azure blob retention (days) |
+| `LOCAL_RETENTION_DAYS` | 7 | Local file retention after successful upload |
+| `MAX_UPLOAD_RETRIES` | 3 | Upload retry attempts before giving up |
+| `MAX_LOCAL_BACKUPS` | 30 | Hard cap on local backup files |
+| `MIN_DISK_SPACE_MB` | 1024 | Emergency cleanup disk threshold (MB) |
+| `NETWORK_CHECK_TIMEOUT` | 5 | Network connectivity check timeout (seconds) |
 
-- **Configuration**: `/etc/pgbackup/config.enc` (encrypted)
-- **Encryption Key**: `/etc/pgbackup/.encryption_key`
-- **Logs**: `/var/log/pgbackup/`
-- **Backups**: `/var/backups/pgbackup/`
-- **Lock File**: `/var/backups/pgbackup/pgbackup.lock`
+## Offline Behavior
+
+The script checks network connectivity before any Azure operations. When offline:
+
+- All upload retries are **skipped entirely** (no more hours of DNS timeouts)
+- New backups are still created locally and marked for retry on the next run
+- Azure cleanup is skipped
+- Local cleanup still runs, enforcing `MAX_LOCAL_BACKUPS` and disk-space limits
+
+## Directory Layout (on server)
+
+```
+/opt/pgSQL-bck-script/       Scripts (this repo)
+/etc/pgbackup/               Encrypted config + encryption key
+/var/log/pgbackup/           Log files (daily rotation recommended)
+/var/backups/pgbackup/       Local backup files (.sql.gz)
+/var/backups/pgbackup/tmp/   Temp files during pg_dump
+```
+
+## Project Structure
+
+```
+pgSQL-Backup-Script/
+├── pg_backup_main.py          # Main backup script
+├── pg_backup_config.py        # Encrypted configuration manager
+├── pg_backup_setup.py         # Interactive first-time setup
+├── pg_backup_cron.sh          # Lightweight cron wrapper
+├── pg_backup.service          # systemd oneshot service
+├── pg_backup.timer            # systemd daily timer (01:00)
+├── pgbackup.logrotate         # Logrotate configuration
+├── install_dependencies.sh    # Dependency installer
+├── setup_permissions.sh       # Fix permissions for postgres user
+├── setup_cron.sh              # Cron job installer
+├── setup_pg_auth.sh           # PostgreSQL auth helper
+├── FIX_CONFIG_PERMISSIONS.sh  # Quick-fix for /etc/pgbackup permissions
+├── MOVE_TO_OPT.sh             # Deploy scripts to /opt
+└── requirements.txt           # Python dependencies
+```
 
 ## Security
 
-- ✅ Configuration encrypted at rest (Fernet symmetric encryption)
-- ✅ Passwords never logged or exposed
-- ✅ Secure authentication methods (Unix socket or .pgpass)
-- ✅ Input validation and sanitization
-- ✅ OWASP Top 10 compliance
+- Configuration encrypted at rest (Fernet symmetric encryption)
+- Passwords never logged or exposed in error messages
+- Secure authentication methods (Unix socket peer auth or .pgpass)
+- Input validation and SQL injection prevention on all identifiers
+- OWASP Top 10 compliance
 
-## Common Issues
+## Troubleshooting
 
 ### Permission Errors
-
 ```bash
 sudo bash setup_permissions.sh
 ```
 
 ### Authentication Failures
 
-**Unix Socket:**
-- Ensure script runs as `postgres` user
-- Verify peer authentication is enabled in `pg_hba.conf`
+**Unix Socket:** Ensure script runs as `postgres` user; verify peer auth in `pg_hba.conf`.
 
-**TCP/IP:**
-- Verify `.pgpass` file format: `hostname:port:database:username:password`
-- Check file permissions: `chmod 600 /root/.pgpass`
-- Test connection: `psql -h localhost -U postgres -l`
+**TCP/IP:** Check `.pgpass` format (`hostname:port:database:username:password`), permissions (`chmod 600`), and test with `psql -h localhost -U postgres -l`.
 
 ### Azure Upload Failures
-
-- Verify Azure storage account name and key
+- Verify account name and key (base64-encoded from Azure Portal > Storage Account > Access Keys)
 - Check network connectivity
-- Review error logs for details
-- Ensure Azure key is base64-encoded (from Azure Portal)
+- Review `/var/log/pgbackup/pgbackup_YYYYMMDD.log`
 
 ### Email Notifications Not Working
-
-- For Gmail: Use App Password, not regular password
-- Generate App Password: https://myaccount.google.com/apppasswords
-- Verify SMTP server and port settings
-
-## Project Structure
-
-```
-pgSQL-bck-script/
-├── pg_backup_main.py          # Main backup script
-├── pg_backup_setup.py          # Interactive setup
-├── pg_backup_config.py         # Configuration management
-├── pg_backup_cron.sh           # Cron wrapper script
-├── install_dependencies.sh    # Dependency installer
-├── setup_permissions.sh        # Permission setup
-├── setup_cron.sh              # Cron setup automation
-├── setup_pg_auth.sh           # PostgreSQL auth helper
-└── requirements.txt           # Python dependencies
-```
+- For Gmail: Use App Password (https://myaccount.google.com/apppasswords)
+- Verify SMTP server, port, and credentials in setup
 
 ## License
 
-[Add your license here]
+MIT
 
 ---
 
-**Status**: ✅ Production-ready  
-**Last Updated**: 2025-11-21
+**Status**: Production-ready
+**Last Updated**: 2026-03-06

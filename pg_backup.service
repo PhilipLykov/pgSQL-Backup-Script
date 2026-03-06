@@ -1,15 +1,18 @@
 [Unit]
 Description=PostgreSQL Backup and Maintenance Service
-After=network.target postgrespro-1c-17.service
+After=network-online.target postgrespro-1c-17.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=root
+User=postgres
+Group=postgres
 WorkingDirectory=/opt/pgSQL-bck-script
 ExecStart=/usr/bin/python3 /opt/pgSQL-bck-script/pg_backup_main.py
 StandardOutput=append:/var/log/pgbackup/service.log
 StandardError=append:/var/log/pgbackup/service.log
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONPATH=/opt/pgSQL-bck-script"
 
 [Install]
 WantedBy=multi-user.target

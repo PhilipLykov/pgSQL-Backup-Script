@@ -1,25 +1,29 @@
 #!/bin/bash
 # Cron wrapper script for PostgreSQL backup
-# This script ensures proper environment and error handling for cron execution
+# This script ensures proper environment and error handling for cron execution.
+#
+# NOTE: The Python backup script already writes detailed logs to
+#   /var/log/pgbackup/pgbackup_YYYYMMDD.log
+# This cron log only captures the wrapper's own status messages and any
+# stderr from the Python process to avoid giant duplicate log files.
 
 # Set script directory
 SCRIPT_DIR="/opt/pgSQL-bck-script"
 SCRIPT="$SCRIPT_DIR/pg_backup_main.py"
 
-# Set up logging
+# Set up logging (lightweight cron-only log)
 LOG_DIR="/var/log/pgbackup"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CRON_LOG="$LOG_DIR/cron_${TIMESTAMP}.log"
 
 # Ensure log directory exists and is writable
 mkdir -p "$LOG_DIR" 2>/dev/null || {
-    # Fallback to /tmp if /var/log/pgbackup not writable
     CRON_LOG="/tmp/pgbackup_cron_${TIMESTAMP}.log"
 }
 
 # Function to log messages
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$CRON_LOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CRON_LOG"
 }
 
 # Check if script exists
@@ -40,16 +44,14 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Set Python path if needed
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
-# Run the backup script
 log_message "Starting PostgreSQL backup (cron job)"
-log_message "Script: $SCRIPT"
 log_message "User: $(whoami)"
-log_message "Working directory: $(pwd)"
 
-# Execute the backup script and capture output
-if python3 "$SCRIPT" >> "$CRON_LOG" 2>&1; then
-    EXIT_CODE=$?
-    log_message "Backup completed successfully (exit code: $EXIT_CODE)"
+# Execute the backup script.
+# stdout goes to /dev/null (already captured by the Python logger to its own log file).
+# Only stderr is captured in the cron log for debugging unexpected crashes.
+if python3 "$SCRIPT" > /dev/null 2>> "$CRON_LOG"; then
+    log_message "Backup completed successfully"
     exit 0
 else
     EXIT_CODE=$?

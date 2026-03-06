@@ -1,0 +1,15 @@
+# Logrotate configuration for PostgreSQL Backup Script
+# Install: sudo cp pgbackup.logrotate /etc/logrotate.d/pgbackup
+
+/var/log/pgbackup/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 postgres postgres
+    dateext
+    dateformat -%Y%m%d
+    maxsize 50M
+}
